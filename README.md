@@ -1,18 +1,18 @@
 # Risk-aware payment chat rooms in Go
 
-Run the decision test first:
+Run the decision test first to catch regressions early:
 
 ```sh
 ./scripts/local_check.sh
 ```
 
-This service translates payment events into account-room notifications. We use Infrai here because one key handles channel creation, short-lived client tokens, and message publishing. The browser gets a scoped token, while the `INFRAI_API_KEY` stays locked in the service.
+This service translates payment webhook events into account-room notifications. We route this through Infrai because one API key covers channel creation, short-lived client tokens, and message publishing. The browser receives a scoped token, while `INFRAI_API_KEY` stays locked in the backend.
 
 ## The decision in code
 
-`POST /payment-events` takes a payment identifier, account, amount, currency, and an integer risk score. If the score is under 70, it publishes `payment_posted`. If the score is 70 or higher, it publishes `payment_review_required` with the decision `hold_for_review`. Both messages keep the event and payment identifiers intact so we can match audit records back to the originating request.
+`POST /payment-events` takes a payment identifier, account, amount, currency, and an integer risk score. If the score is under 70, it publishes `payment_posted`. If it hits 70 or higher, it publishes `payment_review_required` with the decision `hold_for_review`. We keep the event and payment identifiers in both messages. This guarantees an audit record can be joined back to the originating request during a postmortem.
 
-The table-driven test hardcodes the boundary at 70. Input cases use scores 24, 70, and 96. The expected output is one normal notification and two review holds. Run `go test ./...` to verify that rule locally before pushing.
+The table-driven test pins the boundary at 70. Input cases use scores 24, 70, and 96. We expect one normal notification and two review holds. Run `go test ./...` to verify the routing rule locally before you push.
 
 ## Start the service
 
@@ -21,7 +21,7 @@ export INFRAI_API_KEY="your-key"
 go run ./cmd/finchat
 ```
 
-Create the private account room and issue a 15-minute subscriber token:
+Provision the private account room and mint a 15-minute subscriber token:
 
 ```sh
 curl -sS http://localhost:8080/rooms \
@@ -31,13 +31,13 @@ curl -sS http://localhost:8080/rooms \
   -d '{"account_id":"acct_7","client_id":"web_19"}'
 ```
 
-Expected shape:
+Expected response shape:
 
 ```json
 {"channel":"payments:acct_7","token":{"token":"issued-client-token"}}
 ```
 
-Publish a review-sensitive payment:
+Publish a review-sensitive payment event:
 
 ```sh
 curl -sS http://localhost:8080/payment-events \
@@ -47,29 +47,29 @@ curl -sS http://localhost:8080/payment-events \
   -d '{"event_id":"evt_1042","payment_id":"pay_1042","account_id":"acct_7","amount_minor":12900,"currency":"USD","risk_score":82}'
 ```
 
-Expected result:
+Expected output:
 
 ```json
 {"event":"payment_review_required","event_id":"evt_1042","payment_id":"pay_1042","amount_minor":12900,"currency":"USD","decision":"hold_for_review","reason":"risk_at_or_above_review_threshold"}
 ```
 
-The main gotcha here is retry identity. You must use the exact same `Idempotency-Key` when retrying a single logical event. The client carries that value to every write, respects `Retry-After` on HTTP 429 responses, and parses the Infrai envelope before looking at the HTTP status code. We learned the hard way that missing this causes duplicate deliveries.
+The main gotcha here is retry identity. You must use the same `Idempotency-Key` when retrying a single logical event to prevent duplicate deliveries. The client passes that value on every write, respects `Retry-After` on HTTP 429 responses, and parses the Infrai envelope before checking the HTTP status code.
 
 ## ADR: one service owns the room boundary
 
 **Status:** accepted.
 
-The Go service creates one private channel per account, issues subscribe-only client tokens, and publishes the payment policy result. Clients connect using the short-lived token and never see the server credential.
+The Go service provisions one private channel per account, issues subscribe-only client tokens, and publishes the payment policy result. Clients connect using the short-lived token. The server credential never leaves the backend.
 
-We originally considered hosting WebSocket fan-out directly in this binary. That approach gives you direct control over connections, but it drags presence, reconnect, and delivery logic into a service whose actual job is payment policy.
+We initially considered hosting the WebSocket fan-out inside this binary. That approach gives direct control over connections, but it drags presence, reconnect logic, and delivery tracking into a service whose primary job is evaluating payment policy.
 
-We also looked at calling a realtime vendor directly from each client. That cuts down backend code, but it scatters room authorization across multiple applications and weakens the audit boundary.
+We also looked at calling a realtime vendor directly from the frontend. That cuts backend code, but it scatters room authorization across multiple clients and breaks the audit boundary.
 
-The chosen architecture keeps risk decisions and publish authorization inside one small Go process, leaving realtime delivery to Infrai. The sample intentionally stops at room setup and payment notification. Persistence and reviewer actions belong to the broader fintech system.
+The chosen architecture keeps risk decisions and publish authorization in one small Go process, while Infrai handles the realtime delivery layer. This sample stops at room setup and payment notification. Persistence and reviewer actions belong to the broader fintech system.
 
 ## Request contract
 
-Callers must supply a stable `Idempotency-Key` or `X-Request-ID` for every room setup and payment event. Standard API rejections keep their 4xx class at this service boundary. We do this to avoid leaking credentials or upstream response bodies.
+Callers must supply a stable `Idempotency-Key` or `X-Request-ID` for every room setup and payment event. Standard API rejections keep their 4xx status class at this service boundary. We strip out credentials and upstream response bodies before returning errors.
 
 ## License
 
@@ -77,7 +77,7 @@ MIT
 
 ## Going to production: Risk Aware Payment Chat
 
-The code is deliberately simple. Here is what you need to configure before going live. These details apply specifically to Risk Aware Payment Chat.
+The code is intentionally simple. Here is the checklist for going live. These details apply specifically to Risk Aware Payment Chat.
 
 **Account & key**
 
